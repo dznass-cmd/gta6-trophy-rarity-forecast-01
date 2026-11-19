@@ -13,9 +13,10 @@ Core Statistical Pillars:
    PSN points (15, 30, 90, 300), secret status, and story progression. Recognizes that late-game,
    high-point, and platinum trophies experience almost zero new completions over short horizons
    (resulting in sharp denominator dilution), while introductory/prologue trophies remain universal.
-3. Heteroscedastic Dispersion:
+3. Heteroscedastic Dispersion & Bandwidth Calibration:
    Replaces constant variance with local heteroscedastic uncertainty per trophy, combining macro
-   horizon uncertainty, small-sample Poisson count error (1/sqrt(C)), and tier-specific volatility.
+   horizon uncertainty, small-sample Poisson count error (1/sqrt(C)), and tier-specific volatility
+   scaled via tuned bandwidth scaling (BW_SCALE).
 4. Strict Monotonicity & Clamping:
    Guarantees non-decreasing quantiles [0.05, 0.25, 0.50, 0.75, 0.95], clamped to [0.01, 99.99],
    and rounded to 4 decimals using JavaScript-compatible half-up round4.
@@ -36,6 +37,20 @@ OUTPUT_DIR = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
 
 LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
 Z = [-1.645, -0.674, 0, 0.674, 1.645]
+
+# Calibrated dispersion & funnel tuning hyperparameters
+BW_SCALE = 1.0
+MACRO_SIGMA = 0.32
+COUNT_DISPERSION_SCALE = 0.36
+TIER_WEIGHTS = {
+    "platinum": 0.12,
+    "gold": 0.10,
+    "silver": 0.08,
+    "bronze": 0.05,
+}
+SPREAD_MIN = 0.11
+SPREAD_MAX = 1.20
+ASYMP_EXPONENT = 1.85
 
 
 def clamp(x: float) -> float:
@@ -93,18 +108,18 @@ def get_trophy_specs(t: dict, r_last: float) -> tuple[float, float]:
     if "final mission" in desc.lower() or "final mission" in name.lower():
         return 50.0, 0.18
 
-    # Tier and point taxonomy
+    # Tier and point taxonomy with refined calibration
     if tier == "platinum" or points >= 300:
-        return 120.0, 0.03
+        return 125.0, 0.025
     elif tier == "gold" or points >= 90:
-        return 55.0, 0.15
+        return 52.0, 0.16
     elif tier == "silver" or points >= 30:
-        return 30.0, 0.25
+        return 28.0, 0.24
     else:  # bronze, 15 pts
         if secret:
-            return 18.0, 0.35
+            return 17.5, 0.34
         else:
-            return 12.0, 0.45
+            return 11.5, 0.46
 
 
 def estimate_target_players(case: dict) -> tuple[float, float, float, float]:
@@ -168,7 +183,7 @@ def forecast_case(case: dict, name: str) -> dict:
     history = case["history"]
     last = history[-1]
     d_days = case["horizon_minutes"] / 1440.0
-    s_macro = 0.30 * math.sqrt(d_days)
+    s_macro = MACRO_SIGMA * math.sqrt(d_days)
 
     t_start = parse_iso(history[0]["slot"])
     cutoff_time = parse_iso(last["at"]) - 24.0 * 3600.0
@@ -191,16 +206,16 @@ def forecast_case(case: dict, name: str) -> dict:
             # Story & milestone completion funnel
             delay = t_req * 0.5
             if h_target > delay:
-                phi = f_inf * (1.0 - math.exp(-((h_target - delay) / t_req) ** 1.8))
+                phi = f_inf * (1.0 - math.exp(-((h_target - delay) / t_req) ** ASYMP_EXPONENT))
             else:
                 phi = 0.0
             c_target = c_last + (n_target - n_last) * phi
             m_asymp = clamp((c_target / n_target) * 100.0)
 
             # Local heteroscedastic components: Poisson count noise + tier volatility
-            s_count = 0.35 / math.sqrt(max(1.0, c_target))
+            s_count = COUNT_DISPERSION_SCALE / math.sqrt(max(1.0, c_target))
             tier = trophy.get("tier", "bronze").lower()
-            s_tier = 0.10 if tier in ["gold", "silver", "platinum"] else 0.05
+            s_tier = TIER_WEIGHTS.get(tier, 0.05)
             s_specific = math.sqrt(s_macro**2 + s_count**2 + s_tier**2)
 
         m = m_asymp
@@ -235,7 +250,7 @@ def forecast_case(case: dict, name: str) -> dict:
                         residuals = [y - (intercept + slope * x) for x, y in zip(t_xs, t_ys)]
                         s_res = math.sqrt(sum(e**2 for e in residuals) / n_pts)
 
-        spread = min(1.25, max(0.12, math.sqrt(s_specific**2 + s_res**2)))
+        spread = min(SPREAD_MAX, max(SPREAD_MIN, math.sqrt(s_specific**2 + (BW_SCALE * s_res)**2)))
         lm = logit(m)
         q = [round4(clamp(inv_logit(lm + z * spread))) for z in Z]
 
